@@ -250,13 +250,46 @@ Claude Code traced the search route into `search_songs`, noticed from the git hi
 
 ### Issue 4: Rating a friend's song does not notify them
 
+**Issue #4: I got notified when a friend added my song to a playlist but not when they rated it (status: fixed)**
+
 **How I reproduced it**
 
 nova and darius are friends, and nova shared Midnight Drive. Before rating, `GET /users/<nova id>/notifications` returned a count of 1: the seeded `song_added_to_playlist` notification "darius added your song 'Midnight Drive' to the playlist 'Late Night Vibes'.", which shows the expected notification format. I then sent `POST /songs/<Midnight Drive id>/rate` with `{"user_id": "<darius id>", "score": 5}`. It returned 201 with the saved rating, and the database held one rating row for darius on that song. Calling `GET /users/<nova id>/notifications` again still returned a count of 1, with only the original playlist notification and nothing about the rating. The expected result is a second notification telling nova that darius rated her song. The triggering condition is any rating by one user of a song shared by a different user.
 
-**Root cause**
+**How I found the root cause**
 
-**Fix**
+`POST /songs/<song_id>/rate` is handled by `rate()` in `routes/songs.py`. It checks for `user_id` and `score`, calls `rate_song(user_id, song_id, int(score))` in `services/notification_service.py`, and returns the rating. The other side is `GET /users/<user_id>/notifications`, handled by `notifications()` in `routes/users.py`, which calls `get_notifications()` in the same service file. That function selects `Notification` rows by `user_id`, newest first, with an optional unread filter. In `models.py`, a `Notification` is just a row with a recipient `user_id`, a `notification_type`, a `body` and a `read` flag. So the symptom had two possible explanations. Either the rating never wrote a notification, or it wrote one that the read side did not find (wrong recipient, or filtered out).
+
+Reading `rate_song`, I saw that it validates the score, loads the song and the rater, updates or inserts a `Rating`, commits, and returns, without any mention of notifications. Searching the project for `create_notification` showed exactly one call site, inside `add_to_playlist` in the same file. That function notifies `song.shared_by` with type `song_added_to_playlist` when the adder is someone else. The docstring on `create_notification` even lists `'song_rated'` as an expected type, but nothing ever created one.
+
+I was confident when a scratch script against an in-memory database ruled out the second explanation and confirmed the first. Calling `rate_song` directly saved the rating, and updated it on a second call, while the entire `notification` table stayed at zero rows. That meant nothing was written for any user, not just the wrong one. Separately, creating a `song_rated` notification by hand and reading it back with `get_notifications`, with and without `unread_only`, returned it correctly, so the read path was fine.
+
+**The root cause**
+
+`rate_song()` in `services/notification_service.py` should save the rating and then notify the user who shared the song, the same way `add_to_playlist()` in that file notifies the sharer when someone adds their song to a playlist. Instead it only saved the `Rating` and returned. It never called `create_notification()`, so no `song_rated` row was ever written. The route still returned 201 with the saved rating, which made the request look successful, but when the sharer checked `GET /users/<id>/notifications` there was nothing about the rating. Only the playlist notifications, which do go through `create_notification()`, showed up.
+
+**My fix**
+
+In `rate_song()`, after the rating is committed, I added the same check that `add_to_playlist()` uses. If `song.shared_by` is not the rater, it calls `create_notification()` for `song.shared_by` with type `song_rated` and a body like "darius rated your song 'Midnight Drive' 5 out of 5." The notification is created only after the rating commit succeeds and after all the existing validation, so a rejected rating never produces one. People rating their own songs are skipped, which matches the playlist behavior. A re-rate also sends a notification with the new score, since the sharer would want to know the rating changed. The change is in one function in one file, and nothing else needed to change because `create_notification()` and `get_notifications()` already work.
+
+**My side-effect check**
+
+- **Original reproduction:** I re-ran it from a fresh seed on the live app. After darius rated nova's song Midnight Drive, nova's notifications went from 1 to 2. The new entry was `song_rated` with "darius rated your song 'Midnight Drive' 5 out of 5." above the seeded playlist notification. The rating was saved as one row, as before.
+- **Calling the service directly:**
+  - The rater gets no notification, only the sharer.
+  - Rating your own song creates none.
+  - A re-rate from 4 to 2 keeps a single `Rating` row and adds a notification with the new score.
+  - Invalid scores (0 and 6), an unknown song and an unknown user still raise `ValueError` and create no notification.
+- **Read side:**
+  - New notifications start unread.
+  - On the live app, `?unread_only=true` returned 2 before and 1 after `POST /users/notifications/<id>/read`, which returned 200.
+- **Error responses:** a score of 9 still returns 400 "Score must be between 1 and 5", and a missing `user_id` still returns 400.
+- **Playlist notification:** I did not change `add_to_playlist`. I could not exercise it live, because `POST /playlists/<id>/songs` fails before the notification step, as noted under Issue 5.
+- **Tests:** the full suite is 11 passed and 2 failed, and both failures are the still open playlist issue.
+
+**How AI helped**
+
+Claude Code traced both the rate and the notifications endpoints into `notification_service.py`, searched for every call to `create_notification`, and wrote the scratch script that separated "never created" from "created but not found" before any code changed. It then wrote the fix using the same pattern `add_to_playlist` already used and ran the live and edge case checks.
 
 ### Issue 5: The most recently added song in a playlist never shows up
 
@@ -277,3 +310,4 @@ The seeded playlist Late Night Vibes, created by nova, has seven entries in `pla
 - **Issue #1 (streak resets on Sunday):** Claude Code traced the listen and streak routes into `update_listening_streak`, confirmed the Sunday condition by calling the function directly for every weekday pair, made the one line fix, and ran the side-effect checks listed under that issue.
 - **Issue #2 (Friends Listening Now shows people from yesterday):** Claude Code traced the listening-now route into `get_friends_listening_now`, used a frozen clock script to rule out a timezone mismatch and isolate the 24 hour `RECENT_THRESHOLD`, laid out the window options for me to choose from, and ran the boundary, midnight, deduplication and live feed checks.
 - **Issue #3 (same song shows up more than once in search):** Claude Code traced the search route into `search_songs`, printed the emitted SQL and the raw joined rows to show the `song_tags` join multiplied each song by its tag count, removed the unneeded join, and checked every seeded song plus the related search endpoints afterwards.
+- **Issue #4 (rating a friend's song does not notify them):** Claude Code traced the rate and notifications endpoints, found that `create_notification` had a single caller, proved with a direct service call that rating wrote no notification rows at all while the read path worked, added the missing notification using the existing `add_to_playlist` pattern, and ran the edge case and live endpoint checks.
