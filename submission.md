@@ -44,7 +44,7 @@ It also explained Python and SQLAlchemy behavior along the way:
 
 ### What I verified myself
 
-After each fix, I didn't take the summary at face value. I re-ran the original requests myself to confirm the reported behavior was gone, and for [KWESI: issue number] I also checked the other side of the boundary to make sure the fix didn't break the case that was already working. I read each commit's diff with `git show` to confirm the change was as small as the write-up claimed.
+After each fix, I didn't take the summary at face value. I re-ran the original requests myself to confirm the reported behavior was gone. I read each commit's diff with `git show` to confirm the change was as small as the write-up claimed.
 
 ## Codebase Map
 
