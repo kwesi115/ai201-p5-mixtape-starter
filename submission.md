@@ -207,13 +207,46 @@ Claude Code traced the route into `feed_service.py`, wrote the frozen clock scra
 
 ### Issue 3: The same song shows up more than once in search
 
+**Issue #3: The same song keeps showing up twice in search (status: fixed)**
+
 **How I reproduced it**
 
 `GET /songs/search?q=Anthem` returned a count of 3, with Crown Heights Anthem by Borough Kings listed three times. To find the pattern, I compared several searches with the number of tags each matching song has in the seed. `q=Hours` returned After Hours three times (3 tags). `q=Block` returned Block Party once (1 tag). `q=Elara` returned Still Waters once (0 tags) and Soft Landing once (1 tag). The triggering condition is how many tags a song has. A song shows up once for each of its tags, so songs with three tags appear three times, and songs with one tag or no tags appear once. The expected result is one entry per matching song.
 
-**Root cause**
+**How I found the root cause**
 
-**Fix**
+`GET /songs/search?q=` is handled by `search()` in `routes/songs.py`. It checks that `q` is present, calls `search_songs(query)` in `services/search_service.py`, and returns the list with its length as `count`. Since the route never adds or copies results, the extra entries had to come from the service. `search_songs` builds `select(Song)`, adds `.outerjoin(song_tags, Song.id == song_tags.c.song_id)`, filters with a case-insensitive `ilike` on `Song.title` or `Song.artist`, and runs it with `db.session.execute(...).scalars().all()`. In `models.py`, `song_tags` is the many-to-many association table between songs and tags, and `Song.tags` is a relationship through that same table, which `Song.to_dict()` uses to build the `tags` list. That made the join my suspect, since the filter never touches a tag column and the tags in the output come from the relationship anyway. The git log also showed an earlier commit that moved this query from the legacy `db.session.query(...)` style to the 2.0 `select()` style. The legacy query quietly collapses repeated rows for the same entity, but `select(...).scalars()` does not, so any row multiplication would now reach the user. To confirm, I ran a scratch script against the seeded database:
+- It printed the emitted SQL, which was `FROM song LEFT OUTER JOIN song_tags ... WHERE lower(song.title) LIKE ... OR lower(song.artist) LIKE ...`.
+- It showed the raw joined rows for "Anthem": three rows for Crown Heights Anthem, one per tag id.
+- It ran the same filter without the join and got one row that still carried all three tags through the relationship.
+
+I was confident this was the cause when I searched every one of the thirteen seeded songs by its own title. Each came back exactly max(tag count, 1) times: three times for each three-tag song and once for every song with zero or one tag. That matched the reported symptom exactly.
+
+**The root cause**
+
+`search_songs()` in `services/search_service.py` should return each song whose title or artist contains the query once. Instead, it LEFT OUTER JOINed the `song_tags` association table, which turns one song into one result row per tag it has (and one row with nulls if it has none). The join was not needed for anything: the filter only checks `Song.title` and `Song.artist`, and each result's tags are loaded separately through the `Song.tags` relationship in `to_dict()`. Because the 2.0 style `db.session.execute(select(Song)...).scalars().all()` returns every row without collapsing repeats of the same `Song`, a song with three tags appeared three times in the response and its `count` was inflated, while songs with zero or one tag appeared once. That is why the duplicates looked conditional.
+
+**My fix**
+
+I removed the `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` line from the query in `search_songs()`. The query now selects from `song` alone with the same title and artist filter, so the database returns one row per matching song. The tags in each result still come from the `Song.tags` relationship, so the response shape is unchanged. I chose removing the join over adding `.distinct()` or `.unique()` because the join was the source of the extra rows and served no purpose. Deduplicating afterwards would have left the unneeded join in place and only hidden its effect. It was a one line change in one file. The `song_tags` name is still imported at the top of the file. I left that import as it is to keep the diff to the query itself.
+
+**My side-effect check**
+
+- **Original reproduction:** I re-ran it from a fresh seed on the live app. `q=Anthem` now returns Crown Heights Anthem once (count 1) and `q=Hours` returns After Hours once. `q=Elara` (two songs with zero and one tag) and `q=Block` are unchanged.
+- **Every seeded song, searched by its own title:** each now comes back exactly once, with its complete tag list. For example, Crown Heights Anthem still shows `['rap', 'hip-hop', 'boom bap']` and the untagged songs show `[]`.
+- **Matching rules:**
+  - A broad query for "a" returns all 13 matching songs with no duplicates.
+  - Matching is still case-insensitive (`ANTHEM`, `elara`) and still matches on artist alone (`Borough`).
+  - A query that matches nothing returns an empty list.
+  - A query for a tag name such as "rap" returns nothing, which is the same as before the fix, since search only covers titles and artists.
+- **Related endpoints:**
+  - `GET /songs/search` with no `q` still returns 400.
+  - `GET /songs/<id>` still returns 200, and an unknown id still returns 404.
+- **Tests:** all five tests in `tests/test_search.py` pass now, including `test_search_no_duplicates_multi_tag_song`, which failed before. The full suite is 11 passed and 2 failed, and both failures are the still open playlist issue.
+
+**How AI helped**
+
+Claude Code traced the search route into `search_songs`, noticed from the git history that the query had recently moved to the 2.0 `select()` style, wrote the scratch script that printed the emitted SQL and the raw joined rows, and compared every seeded song's tag count against how many times it was returned. It also ran the live and test suite checks after the fix.
 
 ### Issue 4: Rating a friend's song does not notify them
 
@@ -243,3 +276,4 @@ The seeded playlist Late Night Vibes, created by nova, has seven entries in `pla
 - **Reproduction:** Claude Code wrote throwaway scripts in an untracked `scratch/` folder that reproduced all five issues, including the time-dependent ones, by holding the clock at fixed instants.
 - **Issue #1 (streak resets on Sunday):** Claude Code traced the listen and streak routes into `update_listening_streak`, confirmed the Sunday condition by calling the function directly for every weekday pair, made the one line fix, and ran the side-effect checks listed under that issue.
 - **Issue #2 (Friends Listening Now shows people from yesterday):** Claude Code traced the listening-now route into `get_friends_listening_now`, used a frozen clock script to rule out a timezone mismatch and isolate the 24 hour `RECENT_THRESHOLD`, laid out the window options for me to choose from, and ran the boundary, midnight, deduplication and live feed checks.
+- **Issue #3 (same song shows up more than once in search):** Claude Code traced the search route into `search_songs`, printed the emitted SQL and the raw joined rows to show the `song_tags` join multiplied each song by its tag count, removed the unneeded join, and checked every seeded song plus the related search endpoints afterwards.
