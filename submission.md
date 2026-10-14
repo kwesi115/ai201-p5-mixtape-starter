@@ -1,5 +1,51 @@
 # Mixtape Bug Hunt Submission
 
+## AI Usage
+
+I used Claude Code, Anthropic's coding agent, in my terminal for every milestone of this project. I wrote the instructions for each milestone and set the rules it had to follow, and Claude Code did most of the hands-on work inside those rules: reading files, running the app and scripts, writing the fixes, and drafting this document. Where the root cause entries below say "I", that includes work Claude Code carried out at my direction. Each entry ends with a short note on what it did for that bug.
+
+### What I directed and decided
+
+- I set the order of work and the ground rules for each milestone. The rules were: no app code changes while reproducing, prove a hypothesis by running code before fixing anything, make the smallest fix, one bug per commit, stop after each bug and wait for me, and never push without asking.
+- I moved from one bug to the next only after reading the report for the previous one.
+- For Issue #2, the code alone did not say how long "listening now" should last. Claude Code laid out two options with the evidence for each, a 30 minute rolling window or a "since midnight" cutoff, and I chose the 30 minute window.
+- I chose to stop after four fixes and move to final review, so Issue #5 is reproduced but not fixed.
+- [KWESI: add any other decisions you made or edits you made yourself, for example changes you made to the write-ups or to Claude Code's proposed fixes.]
+
+### Codebase navigation
+
+Claude Code read the README, `app.py`, `models.py`, every file in `routes/` and `services/`, and `seed_data.py`. It then drafted the codebase map: what each file is responsible for, the models and association tables with their notable columns, which route file calls which service file, and two full data flows traced through real function names. Before that, it audited my setup. It checked that `origin` pointed to my fork, that the virtual environment had the required packages, that the database was seeded, and that the `bugfix/mixtape` branch existed. It also started the app with `flask run` and confirmed five endpoints returned 200.
+
+### Debugging
+
+For each bug, Claude Code traced the request from the route into the service and the model, named a suspect, and then tested that suspect by running code before changing anything. It kept all of these throwaway scripts in a `scratch/` folder listed in `.git/info/exclude`, so none of them were committed. Some specific things it did:
+
+- `freezegun` was not installed. To control time for Issues #1 and #2, it swapped in a frozen `datetime` inside the service module instead of adding a new dependency.
+- For Issue #1, it called `update_listening_streak` for all seven consecutive weekday pairs to show that only Saturday to Sunday reset the streak.
+- For Issue #2, it tested a competing timezone explanation and ruled it out by showing the cutoff fell exactly 24 hours back.
+- For Issue #3, it printed the SQL the query generated and the raw joined rows.
+- For Issue #4, it counted rows in the whole notification table to tell "never created" apart from "created but not found".
+
+It also explained Python and SQLAlchemy behavior along the way:
+- `weekday()` returns 6 for Sunday.
+- SQLite hands back datetimes without a timezone.
+- The legacy `query()` API collapses repeated rows for a single model, while `select().scalars()` does not.
+
+### Where things had to be checked, and where the AI was wrong or incomplete
+
+- **Adding a song to a playlist.** The first draft of the map described this as writing a row into `playlist_entries`. On a closer read, Claude Code suspected that insert would fail, because the required `position` and `added_by` columns are never set. It raised this with me in chat and kept it out of the map. The suspicion was only confirmed in Milestone 2, when `POST /playlists/<id>/songs` returned HTTP 500 with `NOT NULL constraint failed: playlist_entries.position`. During final review the map wording was changed so it no longer claimed the row gets written.
+- **Song count.** The docstring in `seed_data.py` says it creates 25 songs. Running the seed showed 13, and the map uses the real number.
+- **The Issue #2 window.** My own milestone instructions mentioned that "today's early-morning listens still show", which pointed toward a calendar day cutoff. The comments in `seed_data.py` pointed toward about 30 minutes. Claude Code asked me rather than picking one.
+- **The Issue #3 explanation.** The point about the legacy query collapsing duplicate rows was first written from memory. It was only checked during final review, by running the same join both ways (one row versus three).
+- **Claims about what I had reviewed.** Claude Code drafted sentences such as "I reviewed the summary against the source files" and "I reviewed the evidence and the diff before committing". It removed them because it had no way of knowing whether I had done those things.
+- **A bundled commit.** Claude Code first committed the Milestone 2 reproduction notes for all five issues together with the Issue #1 fix, because they were still uncommitted when that fix went in. It caught this during final review. With my approval, it rewrote the branch history so the notes have their own `docs:` commit. It checked that every file ended up identical to before the rewrite.
+- **Re-rating in Issue #4.** Claude Code chose to send a new notification every time a user re-rates a song, and flagged that choice to me. [KWESI: say whether you agree with notifying on every re-rate or would have preferred only the first rating.]
+- **Unused import in Issue #3.** The `song_tags` import in `search_service.py` is now unused. It was left in on purpose to keep that commit limited to the query change.
+
+### What I verified myself
+
+[KWESI: add what you verified yourself here. For example: whether you read each diff before saying "next", whether you re-ran any reproduction scripts, tests or endpoints yourself, whether you checked the codebase map against the source files, and anything you corrected.]
+
 ## Codebase Map
 
 Mixtape is a small Flask JSON API for a social music app. Users share songs, rate them, log listens, build collaborative playlists, and see what their friends are playing. The code is split into three layers: an app factory that wires everything together, a models file that defines the database schema, and a pair of folders (`routes/` and `services/`) that separate HTTP handling from business logic. There are no templates or front end; every endpoint returns JSON.
@@ -45,8 +91,8 @@ The services hold all of the query and write logic. Each one imports `db` from `
 
 - `streak_service.py`: `record_listening_event(user_id, song_id)` creates a `ListeningEvent` stamped with the current UTC time, calls `update_listening_streak(user, now)` to adjust `listening_streak` and `last_listened_at` by comparing calendar dates, and commits. `get_streak(user_id)` returns the stored streak.
 - `feed_service.py`: `get_friends_listening_now(user_id)` collects the user's friend ids, queries `ListeningEvent` rows from those friends newer than a cutoff built from the module constant `RECENT_THRESHOLD`, orders them newest first, and keeps only the first event per friend. `get_activity_feed(user_id, limit=20)` returns the latest events from friends with no time cutoff. Both build result dicts with `friend`, `song`, and `listened_at` keys.
-- `search_service.py`: `search_songs(query)` uses a SQLAlchemy 2.0 style `select(Song)` with an outer join to `song_tags` and a case-insensitive `ilike` match on title or artist, executed through `db.session.execute(...).scalars().all()`. `get_song(song_id)` fetches a single song.
-- `notification_service.py`: `create_notification(user_id, notification_type, body)` is the generic helper that inserts and commits a `Notification`. `add_to_playlist(playlist_id, song_id, added_by_user_id)` validates the song, user, and playlist, appends the song to `playlist.songs`, and then calls `create_notification` for the song's original sharer when the adder is someone else. `rate_song(user_id, song_id, score)` validates the score range and the song and user, then updates an existing `Rating` or creates a new one and commits. `get_notifications` and `mark_as_read` handle reading and acknowledging notifications.
+- `search_service.py`: `search_songs(query)` uses a SQLAlchemy 2.0 style `select(Song)` with a case-insensitive `ilike` match on title or artist, executed through `db.session.execute(...).scalars().all()`. Each result's tags come from the `Song.tags` relationship when it is serialized. `get_song(song_id)` fetches a single song.
+- `notification_service.py`: `create_notification(user_id, notification_type, body)` is the generic helper that inserts and commits a `Notification`. `add_to_playlist(playlist_id, song_id, added_by_user_id)` validates the song, user, and playlist, appends the song to `playlist.songs`, and then calls `create_notification` for the song's original sharer when the adder is someone else. `rate_song(user_id, song_id, score)` validates the score range and the song and user, then updates an existing `Rating` or creates a new one, commits, and calls `create_notification` with type `song_rated` for the song's sharer when the rater is someone else. `get_notifications` and `mark_as_read` handle reading and acknowledging notifications.
 - `playlist_service.py`: `create_playlist` inserts a new playlist after checking the creator exists. `get_playlist_songs(playlist_id)` joins `Song` to `playlist_entries`, filters by playlist, orders by `position` ascending, and serializes the songs. `get_playlist` returns playlist metadata, and `get_user_playlists` lists playlists by creator (it is defined in the service but not currently wired to a route).
 
 ### How routes map to services
@@ -67,15 +113,16 @@ The mapping is not one to one. Some actions are grouped by their side effect rat
 3. `rate()` calls `rate_song(user_id, song_id, int(score))` from `services/notification_service.py`.
 4. `rate_song` raises `ValueError` if the score is outside 1 to 5, then loads the `Song` and the rating `User` with `db.session.get`, raising `ValueError` if either is missing.
 5. It queries `Rating` with `filter_by(user_id=..., song_id=...)`. If a rating exists, it overwrites `score`; otherwise it creates a new `Rating` and adds it to the session. This upsert pattern lines up with the `unique_user_song_rating` constraint on the model.
-6. `db.session.commit()` persists the change and the `Rating` instance is returned.
-7. Back in the route, `rating.to_dict()` is returned as JSON with status 201. Any `ValueError` from the service becomes a 400 with an `error` message.
+6. `db.session.commit()` persists the change.
+7. If `song.shared_by` differs from the rater, it calls `create_notification` with type `song_rated` and a message naming the rater, the song and the score. The `Rating` instance is then returned.
+8. Back in the route, `rating.to_dict()` is returned as JSON with status 201. Any `ValueError` from the service becomes a 400 with an `error` message.
 
 ### Data flow: adding a song to a playlist
 
 1. A client sends `POST /playlists/<playlist_id>/songs` with `{"song_id": "...", "added_by": "..."}`.
 2. `add_song()` in `routes/playlists.py` checks both fields and calls `add_to_playlist(playlist_id, song_id, added_by)` from `services/notification_service.py`.
 3. `add_to_playlist` loads the `Song`, the adding `User`, and the `Playlist` (importing `Playlist` locally inside the function), raising `ValueError` for any that are missing.
-4. If the song is not already in `playlist.songs`, it appends it through the relationship, which writes a row into `playlist_entries`, and commits.
+4. If the song is not already in `playlist.songs`, it appends it through that relationship, which is backed by the `playlist_entries` table, and commits.
 5. If `song.shared_by` differs from the adder, it calls `create_notification` with type `song_added_to_playlist` and a message naming the adder, song, and playlist. That helper adds and commits the `Notification`.
 6. The route returns `{"message": "Song added to playlist"}` with status 201.
 
@@ -92,16 +139,12 @@ Reading the playlist back follows `GET /playlists/<playlist_id>/songs` to `get_s
 ### Patterns in how the app is organized
 
 - **Application factory plus blueprints.** Everything is assembled in `create_app`, and each resource area is a separate blueprint with its own URL prefix.
-- **Thin routes, fat services.** Routes only parse input, validate presence of fields, and shape responses. All database work happens in `services/`, and the README directs debugging along the same path: start at the endpoint and trace into the service it calls.
+- **Thin routes, fat services.** Routes only parse input, validate presence of fields, and shape responses. All database work happens in `services/`, and the README suggests reading the code along the same path: start at the endpoint and trace into the service it calls.
 - **Exceptions as the error contract.** Services raise `ValueError` for missing records or bad input, and routes translate that into 400 or 404 JSON errors. There are no custom exception classes.
 - **Serialization on the model.** Each model owns a `to_dict()` method, and services usually return lists of these dicts rather than ORM objects.
 - **Side effects grouped by service.** Notification-producing actions sit together in `notification_service.py`, and streak-affecting listens sit in `streak_service.py`, even though they are reached through song and playlist URLs.
 - **Mixed query styles.** Most services use the legacy `db.session.query(...)` API and `db.session.get(...)` for primary key lookups, while `search_service.py` uses the SQLAlchemy 2.0 `select()` style.
 - **String UUID keys and UTC timestamps** are used consistently across all tables.
-
-### AI assistance
-
-Claude Code was used to help read and summarize the codebase while writing this map.
 
 ---
 
@@ -215,7 +258,7 @@ Claude Code traced the route into `feed_service.py`, wrote the frozen clock scra
 
 **How I found the root cause**
 
-`GET /songs/search?q=` is handled by `search()` in `routes/songs.py`. It checks that `q` is present, calls `search_songs(query)` in `services/search_service.py`, and returns the list with its length as `count`. Since the route never adds or copies results, the extra entries had to come from the service. `search_songs` builds `select(Song)`, adds `.outerjoin(song_tags, Song.id == song_tags.c.song_id)`, filters with a case-insensitive `ilike` on `Song.title` or `Song.artist`, and runs it with `db.session.execute(...).scalars().all()`. In `models.py`, `song_tags` is the many-to-many association table between songs and tags, and `Song.tags` is a relationship through that same table, which `Song.to_dict()` uses to build the `tags` list. That made the join my suspect, since the filter never touches a tag column and the tags in the output come from the relationship anyway. The git log also showed an earlier commit that moved this query from the legacy `db.session.query(...)` style to the 2.0 `select()` style. The legacy query quietly collapses repeated rows for the same entity, but `select(...).scalars()` does not, so any row multiplication would now reach the user. To confirm, I ran a scratch script against the seeded database:
+`GET /songs/search?q=` is handled by `search()` in `routes/songs.py`. It checks that `q` is present, calls `search_songs(query)` in `services/search_service.py`, and returns the list with its length as `count`. Since the route never adds or copies results, the extra entries had to come from the service. `search_songs` builds `select(Song)`, adds `.outerjoin(song_tags, Song.id == song_tags.c.song_id)`, filters with a case-insensitive `ilike` on `Song.title` or `Song.artist`, and runs it with `db.session.execute(...).scalars().all()`. In `models.py`, `song_tags` is the many-to-many association table between songs and tags, and `Song.tags` is a relationship through that same table, which `Song.to_dict()` uses to build the `tags` list. That made the join my suspect, since the filter never touches a tag column and the tags in the output come from the relationship anyway. The git log also showed an earlier commit that moved this query from the legacy `db.session.query(...)` style to the 2.0 `select()` style. The legacy query quietly collapses repeated rows for the same entity, but `select(...).scalars()` does not, so any row multiplication would now reach the user. During final review I confirmed this by running the same join both ways against the seeded data: the legacy `db.session.query(Song)` version returned Crown Heights Anthem once and the `select(Song)` version returned it three times. To confirm, I ran a scratch script against the seeded database:
 - It printed the emitted SQL, which was `FROM song LEFT OUTER JOIN song_tags ... WHERE lower(song.title) LIKE ... OR lower(song.artist) LIKE ...`.
 - It showed the raw joined rows for "Anthem": three rows for Crown Heights Anthem, one per tag id.
 - It ran the same filter without the join and got one row that still carried all three tags through the relationship.
@@ -293,21 +336,10 @@ Claude Code traced both the rate and the notifications endpoints into `notificat
 
 ### Issue 5: The most recently added song in a playlist never shows up
 
+**Issue #5: The last song in a playlist never shows up (status: reproduced, not fixed)**
+
+I fixed four of the five issues for this submission. This one was reproduced during Milestone 2 but not fixed, so it has a reproduction write-up only and no root cause analysis, fix or side-effect check.
+
 **How I reproduced it**
 
 The seeded playlist Late Night Vibes, created by nova, has seven entries in `playlist_entries` at positions 1 through 7, with Free Throws at position 7. `GET /playlists/<Late Night Vibes id>/songs` returned a count of 6, ending at Golden Hour (position 6), and Free Throws was missing. To watch the effect of an addition, I tried `POST /playlists/<Late Night Vibes id>/songs` with `{"song_id": "<Soft Landing id>", "added_by": "<darius id>"}`, but in this build that request returned HTTP 500 and no row was written. So the throwaway script added Soft Landing as position 8 directly in `playlist_entries`, the same way the seed script adds entries. After that, the table held 8 entries and the endpoint returned a count of 7. Free Throws now appeared as the last song, and Soft Landing, the newest addition, was the one missing. The triggering condition is simply having any songs in the playlist. Whatever song holds the highest position is always left out of the response, so each new addition hides itself and brings back the song added before it.
-
-**Root cause**
-
-**Fix**
-
----
-
-## AI Usage
-
-- **Codebase orientation:** Claude Code helped read and summarize the codebase for the map above.
-- **Reproduction:** Claude Code wrote throwaway scripts in an untracked `scratch/` folder that reproduced all five issues, including the time-dependent ones, by holding the clock at fixed instants.
-- **Issue #1 (streak resets on Sunday):** Claude Code traced the listen and streak routes into `update_listening_streak`, confirmed the Sunday condition by calling the function directly for every weekday pair, made the one line fix, and ran the side-effect checks listed under that issue.
-- **Issue #2 (Friends Listening Now shows people from yesterday):** Claude Code traced the listening-now route into `get_friends_listening_now`, used a frozen clock script to rule out a timezone mismatch and isolate the 24 hour `RECENT_THRESHOLD`, laid out the window options for me to choose from, and ran the boundary, midnight, deduplication and live feed checks.
-- **Issue #3 (same song shows up more than once in search):** Claude Code traced the search route into `search_songs`, printed the emitted SQL and the raw joined rows to show the `song_tags` join multiplied each song by its tag count, removed the unneeded join, and checked every seeded song plus the related search endpoints afterwards.
-- **Issue #4 (rating a friend's song does not notify them):** Claude Code traced the rate and notifications endpoints, found that `create_notification` had a single caller, proved with a direct service call that rating wrote no notification rows at all while the read path worked, added the missing notification using the existing `add_to_playlist` pattern, and ran the edge case and live endpoint checks.
