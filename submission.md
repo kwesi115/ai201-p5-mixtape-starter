@@ -107,14 +107,55 @@ Claude Code was used to help read and summarize the codebase while writing this 
 
 ## Root Cause Analysis
 
-### Bug 1
+All five issues were reproduced starting from a fresh `python seed_data.py`, with the app running through `FLASK_APP=app:create_app flask run` at `http://127.0.0.1:5000`. Each reproduction was run twice from a fresh seed and gave the same result both times. The time-dependent issues (1 and 2) were reproduced with a throwaway script that runs inside the app context, sends requests through the app's own routes with Flask's test client, and holds "now" at a fixed instant by substituting a frozen `datetime` inside the service module for the duration of each request.
 
-_To be completed._
+### Issue 1: Listening streak resets on Sunday
 
-### Bug 2
+**How I reproduced it**
 
-_To be completed._
+I used simone, who starts the seed with a streak of 0 and no previous listen. With the clock held at 18:00 UTC on each day from Monday 2026-10-05 through Tuesday 2026-10-13, I sent one `POST /songs/<Golden Hour id>/listen` with `{"user_id": "<simone id>"}` per day and then called `GET /users/<simone id>/streak`. Every listen returned 201. The streak climbed 1, 2, 3, 4, 5, 6 from Monday through Saturday as expected. On Sunday the response was `{"streak": 1}` instead of 7, even though she had listened the day before. The count then started over from Sunday, giving 2 on Monday and 3 on Tuesday where 8 and 9 were expected. After the script finished, the running server returned the same `{"streak": 3}` for simone, so the stored value matched. The triggering condition is a listen on a Sunday that directly follows a listen on Saturday. Listens on consecutive days anywhere from Monday through Saturday extend the streak normally.
 
-### Bug 3
+**Root cause**
 
-_To be completed._
+**Fix**
+
+### Issue 2: Friends Listening Now shows people from yesterday
+
+**How I reproduced it**
+
+The seeded listening events are stamped from the real clock, so to get a clean picture I created a separate viewer and five friends in the throwaway script, with symmetric friendship rows and exactly one listening event per friend. With "now" held at Wednesday 2026-10-14 08:30 UTC, the friends had last listened 5 minutes ago, 3 hours ago, at 21:00 the previous evening (11.5 hours ago), at 09:30 the previous morning (23 hours ago), and at 07:30 the previous morning (25 hours ago). `GET /feed/<viewer id>/listening-now` returned a count of 4. It included the friend whose last listen was 21:00 the night before and even the one from 09:30 the previous morning, and it left out only the 25 hour old listen. The expected result for a "listening now" feed is just the friends who listened in the last few minutes. The triggering condition is any friend whose most recent listen falls anywhere inside the previous 24 hours, so a friend who stopped listening last night still shows up the next morning.
+
+**Root cause**
+
+**Fix**
+
+### Issue 3: The same song shows up more than once in search
+
+**How I reproduced it**
+
+`GET /songs/search?q=Anthem` returned a count of 3, with Crown Heights Anthem by Borough Kings listed three times. To find the pattern, I compared several searches with the number of tags each matching song has in the seed. `q=Hours` returned After Hours three times (3 tags). `q=Block` returned Block Party once (1 tag). `q=Elara` returned Still Waters once (0 tags) and Soft Landing once (1 tag). The triggering condition is how many tags a song has. A song shows up once for each of its tags, so songs with three tags appear three times, and songs with one tag or no tags appear once. The expected result is one entry per matching song.
+
+**Root cause**
+
+**Fix**
+
+### Issue 4: Rating a friend's song does not notify them
+
+**How I reproduced it**
+
+nova and darius are friends, and nova shared Midnight Drive. Before rating, `GET /users/<nova id>/notifications` returned a count of 1: the seeded `song_added_to_playlist` notification "darius added your song 'Midnight Drive' to the playlist 'Late Night Vibes'.", which shows the expected notification format. I then sent `POST /songs/<Midnight Drive id>/rate` with `{"user_id": "<darius id>", "score": 5}`. It returned 201 with the saved rating, and the database held one rating row for darius on that song. Calling `GET /users/<nova id>/notifications` again still returned a count of 1, with only the original playlist notification and nothing about the rating. The expected result is a second notification telling nova that darius rated her song. The triggering condition is any rating by one user of a song shared by a different user.
+
+**Root cause**
+
+**Fix**
+
+### Issue 5: The most recently added song in a playlist never shows up
+
+**How I reproduced it**
+
+The seeded playlist Late Night Vibes, created by nova, has seven entries in `playlist_entries` at positions 1 through 7, with Free Throws at position 7. `GET /playlists/<Late Night Vibes id>/songs` returned a count of 6, ending at Golden Hour (position 6), and Free Throws was missing. To watch the effect of an addition, I tried `POST /playlists/<Late Night Vibes id>/songs` with `{"song_id": "<Soft Landing id>", "added_by": "<darius id>"}`, but in this build that request returned HTTP 500 and no row was written. So the throwaway script added Soft Landing as position 8 directly in `playlist_entries`, the same way the seed script adds entries. After that, the table held 8 entries and the endpoint returned a count of 7. Free Throws now appeared as the last song, and Soft Landing, the newest addition, was the one missing. The triggering condition is simply having any songs in the playlist. Whatever song holds the highest position is always left out of the response, so each new addition hides itself and brings back the song added before it.
+
+**Root cause**
+
+**Fix**
+
