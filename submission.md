@@ -153,13 +153,57 @@ Claude Code traced the call chain from both routes into `streak_service.py`, wro
 
 ### Issue 2: Friends Listening Now shows people from yesterday
 
+**Issue #2: Friends Listening Now shows people from yesterday (status: fixed)**
+
 **How I reproduced it**
 
 The seeded listening events are stamped from the real clock, so to get a clean picture I created a separate viewer and five friends in the throwaway script, with symmetric friendship rows and exactly one listening event per friend. With "now" held at Wednesday 2026-10-14 08:30 UTC, the friends had last listened 5 minutes ago, 3 hours ago, at 21:00 the previous evening (11.5 hours ago), at 09:30 the previous morning (23 hours ago), and at 07:30 the previous morning (25 hours ago). `GET /feed/<viewer id>/listening-now` returned a count of 4. It included the friend whose last listen was 21:00 the night before and even the one from 09:30 the previous morning, and it left out only the 25 hour old listen. The expected result for a "listening now" feed is just the friends who listened in the last few minutes. The triggering condition is any friend whose most recent listen falls anywhere inside the previous 24 hours, so a friend who stopped listening last night still shows up the next morning.
 
-**Root cause**
+**How I found the root cause**
 
-**Fix**
+`GET /feed/<user_id>/listening-now` is handled by `listening_now()` in `routes/feed.py`. That route only calls `get_friends_listening_now(user_id)` in `services/feed_service.py` and wraps the returned list with a count, so the filtering had to happen in the service. In the service I followed each step:
+- It loads the `User`.
+- It computes `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`.
+- It collects friend ids through the `User.friends` relationship, which goes through the `friendships` association table in `models.py`.
+- It queries `ListeningEvent` rows from those friends with `listened_at >= cutoff`, newest first.
+- It keeps the first event per friend.
+
+`RECENT_THRESHOLD` is a module level constant set to `timedelta(hours=24)`, which was my main suspect. A second possibility was a timezone mismatch, because the cutoff carries a UTC timezone while `ListeningEvent.listened_at` comes back from SQLite without one.
+
+To tell the two apart, I called `get_friends_listening_now` directly from a scratch script against an in-memory database, with the clock frozen at Wednesday 08:30 UTC and one friend per listen age. Friends who listened 1 minute, 31 minutes, 2 hours, 11.5 hours and 23 hours 58 minutes earlier were all returned, and only the friend at 24 hours 1 minute was left out. The script also printed the stored text (`'2026-10-14 08:29:00.000000'`) and the cutoff (`2026-10-13 08:30 UTC`), and the boundary fell exactly 24 hours back. That ruled out the timezone idea, since a mismatch would have shifted the boundary. The moment I was confident was when I set only `RECENT_THRESHOLD` to 30 minutes in memory, with no file edits, and reran the same script. Only the friends from the last 29 minutes came back. That showed the constant alone decided who appeared.
+
+**The root cause**
+
+`get_friends_listening_now()` in `services/feed_service.py` builds its cutoff from the module constant `RECENT_THRESHOLD`, which was set to `timedelta(hours=24)`. The function is meant to show friends who are listening now, and the seed script describes this as listens from about the past 30 minutes, with events two hours old or more excluded. Instead, any friend whose latest `ListeningEvent` fell anywhere in the previous 24 hours passed the `listened_at >= cutoff` filter. A friend who last played a song at 21:00 was still within the window at 08:30 the next morning, so they appeared in "Friends Listening Now" as if they were currently listening.
+
+**My fix**
+
+I changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`. This narrows the window to match what "listening now" means. I chose 30 minutes over a "since midnight" cutoff because a calendar day boundary would still show someone who listened at 00:30 when it is 23:00. It would also hide someone who started a song at 23:55 when it is 00:05. The query, the per friend deduplication, and `get_activity_feed()`, which deliberately has no time filter, are unchanged. It was a one line change in one file.
+
+**My side-effect check**
+
+- **Original reproduction:** I re-ran it from a fresh seed. At a frozen 08:30, only the friend from 5 minutes earlier is shown. The friends from 3 hours ago, from 21:00 the night before, from 09:30 the previous morning and from 25 hours ago are all hidden.
+- **Exact boundary:** a listen 29 minutes old is shown and one 31 minutes old is hidden.
+- **Around midnight, with the clock at 00:10:**
+  - A friend who listened at 00:05 today is shown, so early morning listens still appear.
+  - A friend who listened at 23:55 the night before is shown, because that is only 15 minutes ago and they are still effectively listening.
+  - A friend whose last listen was 23:30 the night before is hidden.
+- **Other feed rules:**
+  - A friend with two recent listens and one five hours old appears once, with the newest song.
+  - A user who is not a friend is never shown.
+  - A user with no friends gets an empty list.
+  - An unknown user still raises `ValueError`, which the route turns into a 404.
+- **Activity feed:** `get_activity_feed` still returned all six friend events, including the five hour old one.
+- **Live app, real clock:**
+  - nova's listening-now showed darius, simone and kenji, all from 10 to 20 minutes earlier.
+  - darius's listening-now showed simone but no longer showed nova, whose latest listen was two hours old.
+  - darius's activity feed still listed that two hour old listen.
+  - `/feed/nope/listening-now` returned 404.
+- **Tests:** the full suite is unchanged, with 10 passed and 3 failed. All 3 failures are the still open search and playlist issues.
+
+**How AI helped**
+
+Claude Code traced the route into `feed_service.py`, wrote the frozen clock scratch script that ruled out a timezone problem and showed the 24 hour constant alone decided the result, and ran the boundary, midnight and live endpoint checks. When choosing the new window, it presented the 30 minute rolling window and the "since midnight" option along with the evidence from the seed script, and I picked the 30 minute window.
 
 ### Issue 3: The same song shows up more than once in search
 
@@ -198,3 +242,4 @@ The seeded playlist Late Night Vibes, created by nova, has seven entries in `pla
 - **Codebase orientation:** Claude Code helped read and summarize the codebase for the map above.
 - **Reproduction:** Claude Code wrote throwaway scripts in an untracked `scratch/` folder that reproduced all five issues, including the time-dependent ones, by holding the clock at fixed instants.
 - **Issue #1 (streak resets on Sunday):** Claude Code traced the listen and streak routes into `update_listening_streak`, confirmed the Sunday condition by calling the function directly for every weekday pair, made the one line fix, and ran the side-effect checks listed under that issue.
+- **Issue #2 (Friends Listening Now shows people from yesterday):** Claude Code traced the listening-now route into `get_friends_listening_now`, used a frozen clock script to rule out a timezone mismatch and isolate the 24 hour `RECENT_THRESHOLD`, laid out the window options for me to choose from, and ran the boundary, midnight, deduplication and live feed checks.
