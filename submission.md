@@ -111,13 +111,45 @@ All five issues were reproduced starting from a fresh `python seed_data.py`, wit
 
 ### Issue 1: Listening streak resets on Sunday
 
+**Issue #1: My listening streak keeps resetting (status: fixed)**
+
 **How I reproduced it**
 
 I used simone, who starts the seed with a streak of 0 and no previous listen. With the clock held at 18:00 UTC on each day from Monday 2026-10-05 through Tuesday 2026-10-13, I sent one `POST /songs/<Golden Hour id>/listen` with `{"user_id": "<simone id>"}` per day and then called `GET /users/<simone id>/streak`. Every listen returned 201. The streak climbed 1, 2, 3, 4, 5, 6 from Monday through Saturday as expected. On Sunday the response was `{"streak": 1}` instead of 7, even though she had listened the day before. The count then started over from Sunday, giving 2 on Monday and 3 on Tuesday where 8 and 9 were expected. After the script finished, the running server returned the same `{"streak": 3}` for simone, so the stored value matched. The triggering condition is a listen on a Sunday that directly follows a listen on Saturday. Listens on consecutive days anywhere from Monday through Saturday extend the streak normally.
 
-**Root cause**
+**How I found the root cause**
 
-**Fix**
+I started at the two endpoints involved. `GET /users/<id>/streak` is handled by `streak()` in `routes/users.py`, which calls `get_streak()` in `services/streak_service.py`. That function only loads the `User` and returns the stored `listening_streak` column, so the read side was just reporting a value that had already been saved wrong. The value is written on the other path: `POST /songs/<id>/listen` goes to `listen()` in `routes/songs.py`, which calls `record_listening_event()`. That function creates a `ListeningEvent` stamped with the current UTC time, passes the user and that time to `update_listening_streak(user, now)`, and commits. I checked `models.py` to confirm that `User.listening_streak` is a plain integer and `last_listened_at` is a `DateTime` with no timezone, which SQLite stores as naive UTC. Inside `update_listening_streak`, the branch that increments the streak required `days_since_last == 1 and today.weekday() != 6`, and in Python `weekday()` returns 6 for Sunday. That made it my main suspect, and the existing `test_streak_increments_on_sunday` test also failed with `assert 1 == 2`. I became confident it was the cause, and not just an odd looking line, when I called `update_listening_streak` directly from a scratch script for all seven consecutive day pairs with a starting streak of 5. Six pairs produced 6 and only Saturday to Sunday produced 1. The same script showed that same day listens, skipped days, and a first ever listen were already handled correctly, so nothing else in the function was contributing.
+
+**The root cause**
+
+`update_listening_streak()` in `services/streak_service.py` decides between "increment" and "reset" by comparing calendar dates. It should increment whenever the previous listen was exactly one calendar day earlier. Instead the increment branch also required `today.weekday() != 6`, so whenever "today" was a Sunday the condition was false even with a one day gap, and the call fell through to the `else` branch that sets the streak to 1. Because `record_listening_event()` runs this on every listen and `get_streak()` simply returns the saved column, a user who listened every day saw their streak drop to 1 the first time they listened on a Sunday, and the count then started over from there.
+
+**My fix**
+
+I removed the `and today.weekday() != 6` clause, so the branch is now `elif days_since_last == 1:`. A one day gap now increments the streak on every day of the week, while the existing `days_since_last == 0` branch (no change) and the `else` branch (reset for gaps of two or more days) are untouched. This was a one line change in one file. No other code reads the weekday or depends on that clause.
+
+**My side-effect check**
+
+- **Original reproduction:** I re-ran it from a fresh seed. Simone's streak now goes 1 through 7 from Monday to Sunday and continues to 8 and 9 on Monday and Tuesday.
+- **Both sides of the boundary, calling the service directly:**
+  - Every consecutive day pair, Saturday to Sunday included, now increments from 5 to 6.
+  - Saturday 23:59 to Sunday 00:01 increments.
+  - A naive Saturday timestamp, the way SQLite returns it, followed by a Sunday listen increments.
+  - Streaks that should reset still reset: Friday to Sunday with Saturday skipped, Saturday to Monday with Sunday skipped, and Sunday to Tuesday all go to 1.
+  - A second listen on the same Sunday leaves the streak unchanged.
+  - A first ever listen on a Sunday starts the streak at 1.
+- **Tests:** all five tests in `tests/test_streaks.py` pass now, including `test_streak_increments_on_sunday`, which failed before. The only remaining failures in the suite belong to the search and playlist issues, which I have not touched.
+- **Live app, real clock:**
+  - nova had already listened today, and `POST /songs/<id>/listen` left her streak at 7.
+  - darius last listened yesterday and went from 3 to 4.
+  - aaliya has no `last_listened_at` and was set to 1.
+  - `GET /users/<id>` returned 200, and `GET /feed/<id>/activity` returned 200 with the new listening events.
+  - An unknown user still gets 400 from the listen endpoint and 404 from the streak endpoint.
+
+**How AI helped**
+
+Claude Code traced the call chain from both routes into `streak_service.py`, wrote the scratch script that called `update_listening_streak` for every weekday pair to confirm the Sunday condition was the only cause, and ran the before and after checks.
 
 ### Issue 2: Friends Listening Now shows people from yesterday
 
@@ -159,3 +191,10 @@ The seeded playlist Late Night Vibes, created by nova, has seven entries in `pla
 
 **Fix**
 
+---
+
+## AI Usage
+
+- **Codebase orientation:** Claude Code helped read and summarize the codebase for the map above.
+- **Reproduction:** Claude Code wrote throwaway scripts in an untracked `scratch/` folder that reproduced all five issues, including the time-dependent ones, by holding the clock at fixed instants.
+- **Issue #1 (streak resets on Sunday):** Claude Code traced the listen and streak routes into `update_listening_streak`, confirmed the Sunday condition by calling the function directly for every weekday pair, made the one line fix, and ran the side-effect checks listed under that issue.
