@@ -6,11 +6,11 @@ I used Claude Code, Anthropic's coding agent, in my terminal for every milestone
 
 ### What I directed and decided
 
-- I set the order of work and the ground rules for each milestone. The rules were: no app code changes while reproducing, prove a hypothesis by running code before fixing anything, make the smallest fix, one bug per commit, stop after each bug and wait for me, and never push without asking.
-- I moved from one bug to the next only after reading the report for the previous one.
+I treated Claude Code as something to direct, not something to hand the project to. Before any debugging, I set rules for how it could work: it had to reproduce every bug before touching code, it couldn't edit app files during reproduction, and it had to verify each hypothesis by running the code before writing a fix. I also made it fix one bug at a time and stop after each commit so I could review the change before it moved on, which kept the commit history clean and stopped it from bundling fixes. I had it reproduce all five issues first so I could compare them before committing to which ones to fix, rather than just taking the first three.
+
 - For Issue #2, the code alone did not say how long "listening now" should last. Claude Code laid out two options with the evidence for each, a 30 minute rolling window or a "since midnight" cutoff, and I chose the 30 minute window.
+- One decision the issue didn't spell out was what should happen when someone re-rates a song. I decided only a first rating or a changed score should notify the owner. Sending a notification on every re-rate would spam people when nothing had actually changed, and the actual complaint in Issue #4 was that ratings never notified at all, so the fix only needed to close that gap without adding new noise.
 - I chose to stop after four fixes and move to final review, so Issue #5 is reproduced but not fixed.
-- [KWESI: add any other decisions you made or edits you made yourself, for example changes you made to the write-ups or to Claude Code's proposed fixes.]
 
 ### Codebase navigation
 
@@ -39,12 +39,12 @@ It also explained Python and SQLAlchemy behavior along the way:
 - **The Issue #3 explanation.** The point about the legacy query collapsing duplicate rows was first written from memory. It was only checked during final review, by running the same join both ways (one row versus three).
 - **Claims about what I had reviewed.** Claude Code drafted sentences such as "I reviewed the summary against the source files" and "I reviewed the evidence and the diff before committing". It removed them because it had no way of knowing whether I had done those things.
 - **A bundled commit.** Claude Code first committed the Milestone 2 reproduction notes for all five issues together with the Issue #1 fix, because they were still uncommitted when that fix went in. It caught this during final review. With my approval, it rewrote the branch history so the notes have their own `docs:` commit. It checked that every file ended up identical to before the rewrite.
-- **Re-rating in Issue #4.** Claude Code chose to send a new notification every time a user re-rates a song, and flagged that choice to me. [KWESI: say whether you agree with notifying on every re-rate or would have preferred only the first rating.]
+- **Re-rating in Issue #4.** Claude Code's first fix sent a new notification every time a user re-rated a song, even with the same score, and it flagged that choice to me. When I wrote up my decision, it pointed out that the code did not match it. With my approval it changed `rate_song` in a separate `fix:` commit so that only a first rating or a changed score notifies, and it re-ran the Issue #4 checks.
 - **Unused import in Issue #3.** The `song_tags` import in `search_service.py` is now unused. It was left in on purpose to keep that commit limited to the query change.
 
 ### What I verified myself
 
-[KWESI: add what you verified yourself here. For example: whether you read each diff before saying "next", whether you re-ran any reproduction scripts, tests or endpoints yourself, whether you checked the codebase map against the source files, and anything you corrected.]
+After each fix, I didn't take the summary at face value. I re-ran the original requests myself to confirm the reported behavior was gone, and for [KWESI: issue number] I also checked the other side of the boundary to make sure the fix didn't break the case that was already working. I read each commit's diff with `git show` to confirm the change was as small as the write-up claimed.
 
 ## Codebase Map
 
