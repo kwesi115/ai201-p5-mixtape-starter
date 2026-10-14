@@ -98,6 +98,9 @@ def rate_song(user_id: str, song_id: str, score: int) -> Rating:
         user_id=user_id, song_id=song_id
     ).first()
 
+    # Only a new rating or a changed score is worth notifying about
+    score_changed = existing is None or existing.score != score
+
     if existing:
         existing.score = score
         rating = existing
@@ -108,7 +111,7 @@ def rate_song(user_id: str, song_id: str, score: int) -> Rating:
     db.session.commit()
 
     # Notify the person who originally shared the song (if it wasn't them who rated it)
-    if song.shared_by != user_id:
+    if song.shared_by != user_id and score_changed:
         create_notification(
             user_id=song.shared_by,
             notification_type="song_rated",

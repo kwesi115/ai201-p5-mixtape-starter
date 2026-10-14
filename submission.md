@@ -313,7 +313,9 @@ I was confident when a scratch script against an in-memory database ruled out th
 
 **My fix**
 
-In `rate_song()`, after the rating is committed, I added the same check that `add_to_playlist()` uses. If `song.shared_by` is not the rater, it calls `create_notification()` for `song.shared_by` with type `song_rated` and a body like "darius rated your song 'Midnight Drive' 5 out of 5." The notification is created only after the rating commit succeeds and after all the existing validation, so a rejected rating never produces one. People rating their own songs are skipped, which matches the playlist behavior. A re-rate also sends a notification with the new score, since the sharer would want to know the rating changed. The change is in one function in one file, and nothing else needed to change because `create_notification()` and `get_notifications()` already work.
+In `rate_song()`, after the rating is committed, I added the same check that `add_to_playlist()` uses. If `song.shared_by` is not the rater, it calls `create_notification()` for `song.shared_by` with type `song_rated` and a body like "darius rated your song 'Midnight Drive' 5 out of 5." The notification is created only after the rating commit succeeds and after all the existing validation, so a rejected rating never produces one. People rating their own songs are skipped, which matches the playlist behavior. The change is in one function in one file, and nothing else needed to change because `create_notification()` and `get_notifications()` already work.
+
+The issue did not say what should happen when someone re-rates a song. My first version sent a notification on every re-rate, even when the score stayed the same. During final review I decided that only a first rating or a changed score should notify the owner, and made that a separate follow-up commit. Before it overwrites an existing rating, `rate_song()` now records `score_changed = existing is None or existing.score != score`, and the notification check became `song.shared_by != user_id and score_changed`.
 
 **My side-effect check**
 
@@ -322,6 +324,8 @@ In `rate_song()`, after the rating is committed, I added the same check that `ad
   - The rater gets no notification, only the sharer.
   - Rating your own song creates none.
   - A re-rate from 4 to 2 keeps a single `Rating` row and adds a notification with the new score.
+  - After the follow-up change, a re-rate with the same score (4 to 4, 2 to 2) saves the rating but sends no notification. A first rating from a second friend still notifies. Re-rating your own song still sends nothing.
+  - On the live app, darius rating nova's song 5 took her notifications from 1 to 2, re-rating 5 left it at 2, and re-rating 3 took it to 3. The stored score was 3.
   - Invalid scores (0 and 6), an unknown song and an unknown user still raise `ValueError` and create no notification.
 - **Read side:**
   - New notifications start unread.
